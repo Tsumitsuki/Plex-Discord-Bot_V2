@@ -9,5 +9,5 @@ const client = new Discord.Client();
 const bot = new Bot(client);
 // bot functions ---------------------------------------------------------------
 require('./app/music.js')(client, bot);
-
+console.log(keys.botToken);
 client.login(keys.botToken);
