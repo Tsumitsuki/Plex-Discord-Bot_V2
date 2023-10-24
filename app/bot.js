@@ -9,11 +9,24 @@ const xml2json = require('xml2js');
 const request = require('request');
 const fetch = require('node-fetch');
 const { Readable } = require('stream');
+const {
+	NoSubscriberBehavior,
+	StreamType,
+	createAudioPlayer,
+	createAudioResource,
+	entersState,
+	AudioPlayerStatus,
+	VoiceConnectionStatus,
+	joinVoiceChannel
+} = require('@discordjs/voice');
 const language = require('../'+config.language);
 // plex constants ------------------------------------------------------------
 const plexConfig = require('../config/plex');
+const { channel } = require('diagnostics_channel');
 const PLEX_PLAY_START = (plexConfig.https ? 'https://' : 'http://') + plexConfig.hostname + ':' + plexConfig.port;
 const PLEX_PLAY_END = '?X-Plex-Token=' + plexConfig.token;
+
+const maxTransmissionGap = 5000;
 
 function getRandomNumber(max) {
 	return Math.floor(Math.random() * Math.floor(max));
@@ -241,29 +254,53 @@ class Bot extends EventEmitter{
 		return this.trackToMusic(liste[0]);
 	};
 
-	/**
-	 *
-	 */
+	async listPlaylist(message) {
+		const res = await this.plex.query('/playlists?playlistType=audio' + '&X-Plex-Container-Start=' + 0 + '&X-Plex-Container-Size=' + 100);
+		if(res.MediaContainer.Metadata === undefined || res.MediaContainer.Metadata.length === 0) {
+			throw new Error("Playlist not find");
+		}
+
+		return res.MediaContainer.Metadata;
+	}
+
 	async findPlaylist(query, message, random) {
-		const res = await this.findTracksOnPlex(query, 0, 10, 15);
-		const key = res.MediaContainer.Metadata[0].key;
-		const url = PLEX_PLAY_START + key + PLEX_PLAY_END;
-		this.loadPlaylist(url, message, random);
+		const queryHTTP = encodeURI(query);
+		const res = await this.plex.query('/playlists?playlistType=audio' + '&title=' + queryHTTP + '&X-Plex-Container-Start=' + 0 + '&X-Plex-Container-Size=' + 100);
+
+		if(res.MediaContainer.Metadata === undefined || res.MediaContainer.Metadata.length === 0) {
+			throw new Error("Playlist not find");
+		}
+		for (const entry of res.MediaContainer.Metadata) {
+			if (entry.title.toLowerCase().includes(query.toLowerCase())) {
+				
+				const url = PLEX_PLAY_START + entry.key + PLEX_PLAY_END;
+				this.loadPlaylist(url, message, random);
+				message.reply(`The playlist "${entry.title}" has been loaded.`);
+				return ;
+			}
+		}
+		
+		
 	}
 
 	/**
 	 *
 	 */
 	async loadPlaylist(url, message, random=false) {
+
 		request(url, (err, res, body) => {
 			xml2json.parseString(body.toString('utf8'), {}, (err, jsonObj) => {
+
 				const tracks = jsonObj.MediaContainer.Track;
 				const resultSize = jsonObj.MediaContainer.$.size;
 
 				for (let i = 0; i < resultSize;i++) {
 					const track = tracks[i].$
+
 					const key = tracks[i].Media[0].Part[0].$.key;
+					
 					const title = track.title;
+					const album = track.parentTitle;
 					let artist = '';
 					if ('originalTitle' in track) {
 						artist = track.originalTitle;
@@ -271,7 +308,7 @@ class Bot extends EventEmitter{
 					else {
 						artist = track.grandparentTitle;
 					}
-					this.songQueue.push({'artist' : artist, 'title': title, 'key': key});
+					this.songQueue.push({'artist' : artist, 'title': title, 'album': album, 'key': key});
 				}
 
 				if (random) {
@@ -322,6 +359,7 @@ class Bot extends EventEmitter{
 					const track = tracks[i].$
 					const key = tracks[i].Media[0].Part[0].$.key;
 					const title = track.title;
+					const album = track.parentTitle;
 					let artist = '';
 					if ('originalTitle' in track) {
 						artist = track.originalTitle;
@@ -329,7 +367,7 @@ class Bot extends EventEmitter{
 					else {
 						artist = track.grandparentTitle;
 					}
-					this.songQueue.push({'artist' : artist, 'title': title, 'key': key});
+					this.songQueue.push({'artist' : artist, 'title': title, 'album': album, 'key': key});
 				}
 				if(!this.isPlaying) {
 					this.playSong(message);
@@ -386,6 +424,7 @@ class Bot extends EventEmitter{
 			let key = tracks[songNumber].Media[0].Part[0].key;
 			let artist = '';
 			let title = tracks[songNumber].title;
+			const album = tracks[songNumber].parentTitle;
 			if ('originalTitle' in tracks[songNumber]) {
 				artist = tracks[songNumber].originalTitle;
 			}
@@ -393,7 +432,7 @@ class Bot extends EventEmitter{
 				artist = tracks[songNumber].grandparentTitle;
 			}
 
-			this.songQueue.push({'artist' : artist, 'title': title, 'key': key});
+			this.songQueue.push({'artist' : artist, 'title': title, 'album': album, 'key': key});
 			if (!this.isPlaying) {
 				this.playSong(message)
 			} else {
@@ -406,14 +445,26 @@ class Bot extends EventEmitter{
 		}
 	}
 
+	stop() {
+		this.conn.disconnect();
+		this.dispatcher.stop();
+	}
 	/**
 	 *
 	 */
 	async playSong(message) {
 		
-		if (this.voiceChannel == null)
+		if (this.voiceChannel == null) {
+			if(message.member == null) {
+				message.channel.send("The bot cannot see who send the message, and therefor cannot connect to the voice channel.");
+				return ;
+			}
+			if(message.member.voice == null) {
+				message.channel.send("You are not connected to a voice channel, or the bot cannot see the voice channel.");
+				return ;
+			}
 			this.voiceChannel = message.member.voice.channel;
-
+		}
 		if (this.voiceChannel) {
 			this.emit('will play', message);
 			if(this.workingTask > 0){
@@ -421,8 +472,23 @@ class Bot extends EventEmitter{
 				this.waitForStart = true;
 				this.waitForStartMessage = message;
 			} else {
-				const connection = await this.voiceChannel.join();
-				this.conn = connection;
+				//const connection = await this.voiceChannel.join();
+				const connection = await joinVoiceChannel({
+					channelId: this.voiceChannel.id,
+					guildId: this.voiceChannel.guild.id,
+					adapterCreator: this.voiceChannel.guild.voiceAdapterCreator
+				})
+
+
+				try {
+					await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+					this.conn = connection;
+				} catch (error) {
+					connection.destroy();
+					throw error;
+				}
+
+
 				
 				let readstream;
 				if(this.songQueue[0].key) {
@@ -430,7 +496,7 @@ class Bot extends EventEmitter{
 					let response = await fetch(urlPlex);
 					readstream = Readable.from(response.body, {highWaterMark: 20971520});
 				} else {
-					readstream = ytdl(this.songQueue[0].url, { format: 'audioonly', quality: 'highestaudio' });
+					readstream = ytdl(this.songQueue[0].url, { format: 'audioonly', quality: config.youtube_quality || 'highestaudio' });
 				}
 				this.isPlaying = true;
 
@@ -459,13 +525,38 @@ class Bot extends EventEmitter{
 					}
 				};
 				// 20 971 520 bits = 20Mb
-				this.dispatcher = connection.play(readstream).on('finish', dispatcherFunc).on('start', () => {
+
+				this.dispatcher = createAudioPlayer({
+					behaviors: {
+						noSubscriber: NoSubscriberBehavior.Stop,
+						maxMissedFrames: Math.round(maxTransmissionGap / 20),
+					},
+				});
+				this.dispatcher.on(AudioPlayerStatus.Idle, () => {
+					readstream.destroy();
+					dispatcherFunc()
+				})
+				this.dispatcher.on(AudioPlayerStatus.Playing, () => {
+					if(!this.songQueue[0].played) {
+						let embedObj = this.songToEmbedObject(this.songQueue[0]);
+						message.channel.send({ content: language.BOT_PLAYSONG_SUCCES, embeds: [embedObj] });
+					}
+				});
+				readstream.on('finish', dispatcherFunc)
+				readstream.on('error', (err) => console.error(err));
+				/*
+				.on('start', () => {
 						if(!this.songQueue[0].played) {
 							let embedObj = this.songToEmbedObject(this.songQueue[0]);
-							message.channel.send(language.BOT_PLAYSONG_SUCCES, embedObj);
+							message.channel.send({ content: language.BOT_PLAYSONG_SUCCES, embeds: [embedObj] });
 						}
-				}).on('error', (err) => console.log(err));
-				this.dispatcher.setVolume(this.volume);
+					})
+				*/
+				this.dispatcher.play(createAudioResource(readstream), {
+					inputType: StreamType.OggOpus,
+				})
+				this.conn.subscribe(this.dispatcher);
+				
 			}
 		} else {
 				message.reply(language.BOT_PLAYSONG_FAIL)
@@ -476,27 +567,33 @@ class Bot extends EventEmitter{
 	 *
 	 */
 	songToEmbedObject(song) {
-		const embedObj = {
-			embed: {
+		const embedObj = 
+			{
 				color: 4251856,
 				fields:
 				[
+					{
+						name: language.TITLE,
+						value: song.title,
+						inline: true
+					},
 					{
 						name: language.ARTIST,
 						value: song.artist,
 						inline: true
 					},
-					{
-						name: language.TITLE,
-						value: song.title,
-						inline: true
-					}
 				],
 				footer: {
 					text: language.NUMBER_MUSIC_IN_QUEUE.format({number : this.songQueue.length, plurial : (this.songQueue.length > 1 ? 's' : '')})
 				},
-			}
-		};
+			};
+		if (song.album) {
+			embedObj.fields.push(					{
+				name: language.ALBUM,
+				value: song.album,
+				inline: true
+			})
+		}
 		return embedObj;
 	}
 
@@ -509,7 +606,7 @@ class Bot extends EventEmitter{
 					await this.conn.disconnect();
 			}
 			if(this.voiceChannel) {
-					await this.voiceChannel.leave();
+					//await this.voiceChannel.leave();
 					this.voiceChannel = null;
 			}
 		}
